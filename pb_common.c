@@ -12,7 +12,9 @@ bool pb_field_iter_begin(pb_field_iter_t *iter, const pb_field_t *fields, void *
     iter->required_field_index = 0;
     iter->dest_struct = dest_struct;
     iter->pData = (char*)dest_struct + iter->pos->data_offset;
-    iter->pSize = (char*)iter->pData + iter->pos->size_offset;
+    iter->pSize = iter->pos->size_offset ? (char*)iter->pData + iter->pos->size_offset
+                                         : (void*)&iter->static_size;
+    iter->static_size = 0;
     
     return (iter->pos->tag != 0);
 }
@@ -48,7 +50,7 @@ bool pb_field_iter_next(pb_field_iter_t *iter)
             /* Don't advance pointers inside unions */
             return true;
         }
-        else if (PB_ATYPE(prev_field->type) == PB_ATYPE_STATIC &&
+        else if (PB_ATYPE_IS_STATIC(iter->pos->type) &&
                  PB_HTYPE(prev_field->type) == PB_HTYPE_REPEATED)
         {
             /* In static arrays, the data_size tells the size of a single entry and
@@ -70,7 +72,9 @@ bool pb_field_iter_next(pb_field_iter_t *iter)
         }
     
         iter->pData = (char*)iter->pData + prev_size + iter->pos->data_offset;
-        iter->pSize = (char*)iter->pData + iter->pos->size_offset;
+        iter->pSize = iter->pos->size_offset ? (char*)iter->pData + iter->pos->size_offset
+                                             : (void*)&iter->static_size;
+        iter->static_size = 0;
         return true;
     }
 }

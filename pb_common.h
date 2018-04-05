@@ -19,6 +19,7 @@ struct pb_field_iter_s {
     void *dest_struct;             /* Pointer to start of the structure */
     void *pData;                   /* Pointer to current field value */
     void *pSize;                   /* Pointer to count/has field */
+    size_t static_size; /* Counter used to track array size when the array is defined using has_max_count */
 };
 typedef struct pb_field_iter_s pb_field_iter_t;
 

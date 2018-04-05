@@ -5,6 +5,10 @@
 #ifndef PB_H_INCLUDED
 #define PB_H_INCLUDED
 
+#ifdef __cplusplus
+extern "C" {
+#endif /* __cplusplus */
+
 /*****************************************************************
  * Nanopb compilation time options. You can change these here by *
  * uncommenting the lines, or on the compiler command line.      *
@@ -64,7 +68,19 @@
 #else
 #include <stdint.h>
 #include <stddef.h>
+#ifndef PLATFORM_PC
 #include <stdbool.h>
+#else
+
+//Visual Studio STILL doesn't support the C99 standard so we have to define
+//a bool type manually.  This is how they are defined in Windows headers.
+#ifndef __cplusplus
+typedef int bool;
+#define false 0
+#define true  1
+#endif
+
+#endif
 #include <string.h>
 
 #ifdef PB_ENABLE_MALLOC
@@ -190,14 +206,18 @@ typedef uint_least8_t pb_type_t;
 
 /**** Field allocation types ****/
  
-#define PB_ATYPE_STATIC   0x00
-#define PB_ATYPE_POINTER  0x80
-#define PB_ATYPE_CALLBACK 0x40
-#define PB_ATYPE_MASK     0xC0
+#define PB_ATYPE_STATIC       0x00
+#define PB_ATYPE_STATIC_FIXED 0xC0
+#define PB_ATYPE_POINTER      0x80
+#define PB_ATYPE_CALLBACK     0x40
+#define PB_ATYPE_MASK         0xC0
 
 #define PB_ATYPE(x) ((x) & PB_ATYPE_MASK)
 #define PB_HTYPE(x) ((x) & PB_HTYPE_MASK)
 #define PB_LTYPE(x) ((x) & PB_LTYPE_MASK)
+
+#define PB_ATYPE_IS_STATIC(x) (PB_ATYPE(x) == PB_ATYPE_STATIC || \
+                               PB_ATYPE(x) == PB_ATYPE_STATIC_FIXED)
 
 /* Data type used for storing sizes of struct fields
  * and array counts.
@@ -263,11 +283,21 @@ PB_STATIC_ASSERT(sizeof(uint64_t) == 2 * sizeof(uint32_t), UINT64_T_WRONG_SIZE)
 #define PB_BYTES_ARRAY_T(n) struct { pb_size_t size; pb_byte_t bytes[n]; }
 #define PB_BYTES_ARRAY_T_ALLOCSIZE(n) ((size_t)n + offsetof(pb_bytes_array_t, bytes))
 
+/* A bytes array with has_max_size defined doesn't need to include the size */
+#define PB_BYTES_ARRAY_T_MAX(n) struct { uint8_t bytes[n]; }
+
 struct pb_bytes_array_s {
     pb_size_t size;
     pb_byte_t bytes[1];
 };
 typedef struct pb_bytes_array_s pb_bytes_array_t;
+
+/* The structure above is used for standard nanopb 'bytes' arrays,
+ * while 'bytes' arrays with the 'has_max_size' option set just use
+ * an array of uint8_t without struct with a separate size field.
+ */
+#define PB_BYTES_ARRAY_FIXED_T(n) uint8_t bytes[n];
+#define PB_BYTES_ARRAY_FIXED_T_ALLOCSIZE(n) ((size_t)n)
 
 /* This structure is used for giving the callback function.
  * It is stored in the message structure and filled in by the method that
@@ -410,6 +440,10 @@ struct pb_extension_s {
     {tag, PB_ATYPE_STATIC | PB_HTYPE_REQUIRED | ltype, \
     fd, 0, pb_membersize(st, m), 0, ptr}
 
+#define PB_REQUIRED_STATIC_FIXED(tag, st, m, fd, ltype, ptr) \
+    {tag, PB_ATYPE_STATIC_FIXED | PB_HTYPE_REQUIRED | ltype, \
+    fd, 0, pb_membersize(st, m), 0, ptr}
+
 /* Optional fields add the delta to the has_ variable. */
 #define PB_OPTIONAL_STATIC(tag, st, m, fd, ltype, ptr) \
     {tag, PB_ATYPE_STATIC | PB_HTYPE_OPTIONAL | ltype, \
@@ -420,12 +454,34 @@ struct pb_extension_s {
 #define PB_SINGULAR_STATIC(tag, st, m, fd, ltype, ptr) \
     {tag, PB_ATYPE_STATIC | PB_HTYPE_OPTIONAL | ltype, \
     fd, 0, pb_membersize(st, m), 0, ptr}
+    
+    
+#define PB_OPTIONAL_STATIC_FIXED(tag, st, m, fd, ltype, ptr) \
+    {tag, PB_ATYPE_STATIC_FIXED | PB_HTYPE_OPTIONAL | ltype, \
+    fd, \
+    pb_delta(st, has_ ## m, m), \
+    pb_membersize(st, m), 0, ptr}
 
 /* Repeated fields have a _count field and also the maximum number of entries. */
 #define PB_REPEATED_STATIC(tag, st, m, fd, ltype, ptr) \
     {tag, PB_ATYPE_STATIC | PB_HTYPE_REPEATED | ltype, \
     fd, \
     pb_delta(st, m ## _count, m), \
+    pb_membersize(st, m[0]), \
+    pb_arraysize(st, m), ptr}
+
+#define PB_REPEATED_STATIC_FIXED(tag, st, m, fd, ltype, ptr) \
+    {tag, PB_ATYPE_STATIC_FIXED | PB_HTYPE_REPEATED | ltype, \
+    fd, \
+    pb_delta(st, m ## _count, m), \
+    pb_membersize(st, m[0]), \
+    pb_arraysize(st, m), ptr}
+
+/* Repeated fields with STATIC_MAX don't have a _count field. */
+#define PB_REPEATED_STATIC_MAX(tag, st, m, fd, ltype, ptr) \
+    {tag, PB_ATYPE_STATIC | PB_HTYPE_REPEATED | ltype, \
+    fd, \
+    0, \
     pb_membersize(st, m[0]), \
     pb_arraysize(st, m), ptr}
 
@@ -589,5 +645,9 @@ struct pb_extension_s {
 #endif
 
 #define PB_RETURN_ERROR(stream, msg) return PB_SET_ERROR(stream, msg), false
+
+#ifdef __cplusplus
+}
+#endif /* __cplusplus */
 
 #endif

@@ -1,3 +1,15 @@
+Vitei Settings for nanopb
+==============================================
+
+An altered version of the Nanopb libraries to allow custom extensions for the internal Usagi engine.
+
+
+Original README.md follows bellow
+
+
+
+
+
 Nanopb - Protocol Buffers for Embedded Systems
 ==============================================
 

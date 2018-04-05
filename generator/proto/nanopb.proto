@@ -83,6 +83,36 @@ message NanoPBOptions {
 
   // Generate repeated field with fixed count
   optional bool fixed_count = 16 [default = false];
+
+  // Replace struct definition with a header include, allowing us to define it
+  // ourselves.
+  optional string from_header = 17;
+
+  // Makes repeated fields use our C++ ProtocolBufferVarLength type instead of
+  // nanopb's native pb_callback_t type.  The string value represents the delegate
+  // we should use for decoding.
+  optional string decoder = 18;
+
+  optional bool max_count_enum = 19;
+
+  // These settings output declarations for the OnActivate/OnDeactivate/OnLoaded
+  // specialisations, to force us to provide an implementation. Very Usagi specific!
+  optional bool has_onactivate = 20 [default = false];
+  optional bool has_ondeactivate = 21 [default = false];
+  optional bool has_onloaded = 22 [default = false];
+
+  // This allows us to include some headers at the bottom of the file, after all
+  // the message types (useful for template specialisations)
+  optional string include = 23;
+
+  // The following two lua-related events should really be in usagipb.proto...
+  optional bool lua_receive = 24 [default = true]; // OnEvent callbacks will be fired
+  optional bool lua_send    = 25 [default = true]; // Lua scripts can call Send() on this type
+  optional bool lua_generate = 26 [default = false]; // Lua scripts can call Send() on this type
+
+  // Default pool size for components
+  optional uint32 fastpool_chunksize = 27 [default = 20];
+  optional bool is_gamecomponent = 28 [default = false];
 }
 
 // Extensions to protoc 'Descriptor' type in order to define options
