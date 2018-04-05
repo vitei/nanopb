@@ -8,6 +8,7 @@ nanopb_version = "nanopb-0.3.6-dev"
 import sys
 import re
 from functools import reduce
+import zlib
 
 try:
     # Add some dummy imports to keep packaging tools happy.
@@ -45,6 +46,7 @@ except:
 #                     Generation of single fields
 # ---------------------------------------------------------------------------
 
+import re
 import time
 import os.path
 
@@ -82,30 +84,47 @@ except NameError:
 
 class Names:
     '''Keeps a set of nested names and formats them to C identifier.'''
-    def __init__(self, parts = ()):
+    def __init__(self, parts = (), namespaces = []):
         if isinstance(parts, Names):
             parts = parts.parts
+            if not namespaces:
+                namespaces = parts.namespaces
         self.parts = tuple(parts)
+        self.namespaces = namespaces
 
     def __str__(self):
         return '_'.join(self.parts)
 
     def __add__(self, other):
         if isinstance(other, strtypes):
-            return Names(self.parts + (other,))
+            return Names(self.parts + (other,), self.namespaces)
         elif isinstance(other, tuple):
-            return Names(self.parts + other)
+            return Names(self.parts + other, self.namespaces)
         else:
             raise ValueError("Name parts should be of type str")
 
     def __eq__(self, other):
         return isinstance(other, Names) and self.parts == other.parts
 
+    def ns_prefix(self, delimiter = '::'):
+        result = ''
+
+        if self.namespaces:
+            result = delimiter.join(self.namespaces) + delimiter
+
+        if not result.startswith(delimiter):
+            result = delimiter + result
+
+        return result
+
 def names_from_type_name(type_name):
     '''Parse Names() from FieldDescriptorProto type_name'''
     if type_name[0] != '.':
         raise NotImplementedError("Lookup of non-absolute type names is not supported")
     return Names(type_name[1:].split('.'))
+
+def ns_prefix(ctype, delimiter = '::'):
+    return ctype.ns_prefix(delimiter) if isinstance(ctype, Names) else ''
 
 def varint_max_size(max_value):
     '''Returns the maximum number of bytes a varint can take when encoded.'''
@@ -129,7 +148,7 @@ class EncodedSize:
             self.value = value.value
             self.symbols = value.symbols
         elif isinstance(value, strtypes + (Names,)):
-            self.symbols = [str(value)]
+            self.symbols = [ns_prefix(value) + str(value)]
             self.value = 0
         else:
             self.value = value
@@ -139,14 +158,14 @@ class EncodedSize:
         if isinstance(other, int):
             return EncodedSize(self.value + other, self.symbols)
         elif isinstance(other, strtypes + (Names,)):
-            return EncodedSize(self.value, self.symbols + [str(other)])
+            return EncodedSize(self.value, self.symbols + [ns_prefix(other) + str(other)])
         elif isinstance(other, EncodedSize):
             return EncodedSize(self.value + other.value, self.symbols + other.symbols)
         else:
             raise ValueError("Cannot add size: " + repr(other))
 
     def __mul__(self, other):
-        if isinstance(other, int):
+        if isinstance(other, int) or isinstance(other, long):
             return EncodedSize(self.value * other, [str(other) + '*' + s for s in self.symbols])
         else:
             raise ValueError("Cannot multiply size: " + repr(other))
@@ -177,6 +196,12 @@ class Enum:
 
         self.value_longnames = [self.names + x.name for x in desc.value]
         self.packed = enum_options.packed_enum
+        self.count = len( self.values )
+
+        self.default = '%s' % (self.values[0][0])
+        for (name, number) in self.values:
+            if number == 0:
+                self.default = name
 
     def has_negative(self):
         for n, v in self.values:
@@ -197,6 +222,7 @@ class Enum:
 
         result += ' %s;' % self.names
 
+        result += '\nstatic const pb_size_t _%s_count = %d;' % (self.names, self.count)
         result += '\n#define _%s_MIN %s' % (self.names, self.values[0][0])
         result += '\n#define _%s_MAX %s' % (self.names, self.values[-1][0])
         result += '\n#define _%s_ARRAYSIZE ((%s)(%s+1))' % (self.names, self.names, self.values[-1][0])
@@ -228,7 +254,7 @@ class FieldMaxSize:
         self.checks.extend(extend.checks)
 
 class Field:
-    def __init__(self, struct_name, desc, field_options):
+    def __init__(self, local_namespaces, struct_name, desc, field_options, enums):
         '''desc is FieldDescriptorProto'''
         self.tag = desc.number
         self.struct_name = struct_name
@@ -237,9 +263,16 @@ class Field:
         self.default = None
         self.max_size = None
         self.max_count = None
+        self.has_max_count = False
         self.array_decl = ""
         self.enc_size = None
         self.ctype = None
+        self.decoder = None
+        self.has_max_size = False
+
+        breakdown = desc.type_name.split('.')
+        tn = '.' + breakdown[-1]
+        local_namespaces = breakdown[:-1]
 
         # Parse field options
         if field_options.HasField("max_size"):
@@ -247,6 +280,28 @@ class Field:
 
         if field_options.HasField("max_count"):
             self.max_count = field_options.max_count
+
+        elif field_options.HasField("max_count_enum"):
+            for enum in enums:
+                if str(enum.names) == field_options.max_count_enum:
+                    self.max_count = enum.count
+                    break
+
+            if self.max_count == None:
+                raise Exception("Couldn't get count for " + field_options.max_count_enum)
+
+        if field_options.HasField("has_max_count"):
+            if self.max_count == None:
+                raise Exception("has_max_count defined without max_count")
+            self.has_max_count = field_options.has_max_count
+
+        if field_options.HasField("decoder"):
+            self.decoder = field_options.decoder
+
+        if field_options.HasField("has_max_size"):
+            if not field_options.HasField("max_size"):
+                raise Exception("has_max_size defined without max_size")
+            self.has_max_size = field_options.has_max_size
 
         if desc.HasField('default_value'):
             self.default = desc.default_value
@@ -262,7 +317,7 @@ class Field:
             if self.max_count is None:
                 can_be_static = False
             else:
-                self.array_decl = '[%d]' % self.max_count
+                self.array_decl = '[%s_max_count]' % self.name
         else:
             raise NotImplementedError(desc.label)
 
@@ -286,7 +341,12 @@ class Field:
                             "max_count is not given." % self.name)
 
         if field_options.type == nanopb_pb2.FT_STATIC:
-            self.allocation = 'STATIC'
+            if self.has_max_count:
+                self.allocation = 'STATIC_MAX'
+            elif self.has_max_size:
+                self.allocation = 'STATIC_FIXED'
+            else:
+                self.allocation = 'STATIC'
         elif field_options.type == nanopb_pb2.FT_POINTER:
             self.allocation = 'POINTER'
         elif field_options.type == nanopb_pb2.FT_CALLBACK:
@@ -305,27 +365,34 @@ class Field:
                     self.ctype = 'u' + self.ctype;
         elif desc.type == FieldD.TYPE_ENUM:
             self.pbtype = 'ENUM'
-            self.ctype = names_from_type_name(desc.type_name)
+            self.ctype = names_from_type_name(tn)
+            self.ctype.namespaces = local_namespaces
             if self.default is not None:
                 self.default = self.ctype + self.default
             self.enc_size = None # Needs to be filled in when enum values are known
         elif desc.type == FieldD.TYPE_STRING:
             self.pbtype = 'STRING'
             self.ctype = 'char'
-            if self.allocation == 'STATIC':
+            if self.is_static_allocation():
                 self.ctype = 'char'
                 self.array_decl += '[%d]' % self.max_size
                 self.enc_size = varint_max_size(self.max_size) + self.max_size
         elif desc.type == FieldD.TYPE_BYTES:
             self.pbtype = 'BYTES'
+
             if self.allocation == 'STATIC':
                 self.ctype = self.struct_name + self.name + 't'
                 self.enc_size = varint_max_size(self.max_size) + self.max_size
+            elif self.allocation == 'STATIC_FIXED':
+                self.ctype = 'uint8_t'
+                self.array_decl += '[%d]' % self.max_size
+                self.enc_size = varint_max_size(self.max_size) + self.max_size
             elif self.allocation == 'POINTER':
-                self.ctype = 'pb_bytes_array_t'
+                self.ctype = 'pb_bytes_array_t' if not self.has_max_size else 'uint8_t'
         elif desc.type == FieldD.TYPE_MESSAGE:
             self.pbtype = 'MESSAGE'
-            self.ctype = self.submsgname = names_from_type_name(desc.type_name)
+            self.ctype = self.submsgname = names_from_type_name(tn)
+            self.ctype.namespaces = self.submsgname.namespaces = local_namespaces
             self.enc_size = None # Needs to be filled in after the message type is available
         else:
             raise NotImplementedError(desc.type)
@@ -335,6 +402,9 @@ class Field:
 
     def __str__(self):
         result = ''
+        if self.max_count != None:
+            result += '    enum { %s_max_count = %d };\n' % (self.name, self.max_count)
+
         if self.allocation == 'POINTER':
             if self.rules == 'REPEATED':
                 result += '    pb_size_t ' + self.name + '_count;\n'
@@ -344,33 +414,45 @@ class Field:
                 result += '    struct _%s *%s;' % (self.ctype, self.name)
             elif self.rules == 'REPEATED' and self.pbtype in ['STRING', 'BYTES']:
                 # String/bytes arrays need to be defined as pointers to pointers
-                result += '    %s **%s;' % (self.ctype, self.name)
+                result += '    %s%s **%s;' % (ns_prefix(self.ctype), self.ctype, self.name)
             else:
-                result += '    %s *%s;' % (self.ctype, self.name)
+                result += '    %s%s *%s;' % (ns_prefix(self.ctype), self.ctype, self.name)
         elif self.allocation == 'CALLBACK':
-            result += '    pb_callback_t %s;' % self.name
+            if self.decoder != None:
+                if self.decoder == 'PBU8String':
+                    result += '    ::usg::PBU8String<128> %s;' % (self.name)
+                else:
+                    prefixed_type = '%s%s' % (ns_prefix(self.ctype), self.ctype)
+                    if self.ctype is None:
+                        prefixed_type = 'uint8' # If there is no type, it's probably a bytes array
+                    m = re.search('([^<]*)(<(.*)>)?[^>]*$', self.decoder)
+                    decoder_delegate = m.group(1)
+                    delegate_params = ', ' + m.group(3) if m.group(3) else ''
+                    result += '    ::usg::ProtocolBufferVarLength< %s, ::usg::%s< %s%s > > %s;' % \
+                        (prefixed_type, decoder_delegate, prefixed_type, delegate_params, self.name)
+            else:
+                result += '    pb_callback_t %s;' % self.name
         else:
-            if self.rules == 'OPTIONAL' and self.allocation == 'STATIC':
+            if self.rules == 'OPTIONAL' and self.is_static_allocation():
                 result += '    bool has_' + self.name + ';\n'
-            elif self.rules == 'REPEATED' and self.allocation == 'STATIC':
+            elif self.rules == 'REPEATED' and self.is_static_allocation() and not self.has_max_count:
                 result += '    pb_size_t ' + self.name + '_count;\n'
-            result += '    %s %s%s;' % (self.ctype, self.name, self.array_decl)
+            result += '    %s%s %s%s;' % (ns_prefix(self.ctype), self.ctype, self.name, self.array_decl)
         return result
 
     def types(self):
         '''Return definitions for any special types this field might need.'''
-        if self.pbtype == 'BYTES' and self.allocation == 'STATIC':
-            result = 'typedef PB_BYTES_ARRAY_T(%d) %s;\n' % (self.max_size, self.ctype)
-        else:
-            result = ''
+        result = ''
+
+        if self.pbtype == 'BYTES':
+            if self.allocation == 'STATIC':
+                result = 'typedef PB_BYTES_ARRAY_T(%d) %s;\n' % (self.max_size, self.ctype)
+
         return result
 
     def get_dependencies(self):
         '''Get list of type names used by this field.'''
-        if self.allocation == 'STATIC':
-            return [str(self.ctype)]
-        else:
-            return []
+        return [str(self.ctype)]
 
     def get_initializer(self, null_init, inner_init_only = False):
         '''Return literal expression for this field's default value.
@@ -381,16 +463,16 @@ class Field:
         inner_init = None
         if self.pbtype == 'MESSAGE':
             if null_init:
-                inner_init = '%s_init_zero' % self.ctype
+                inner_init = '%s%s_init_zero' % (ns_prefix(self.ctype, '_'), self.ctype)
             else:
-                inner_init = '%s_init_default' % self.ctype
+                inner_init = '%s%s_init_default' % (ns_prefix(self.ctype, '_'), self.ctype)
         elif self.default is None or null_init:
             if self.pbtype == 'STRING':
                 inner_init = '""'
             elif self.pbtype == 'BYTES':
                 inner_init = '{0, {0}}'
             elif self.pbtype in ('ENUM', 'UENUM'):
-                inner_init = '(%s)0' % self.ctype
+                inner_init = '%s%s_init_default' % (ns_prefix(self.ctype, '_'), self.ctype)
             else:
                 inner_init = '0'
         else:
@@ -409,6 +491,11 @@ class Field:
                 inner_init = str(self.default) + 'ull'
             elif self.pbtype in ['SFIXED64', 'INT64']:
                 inner_init = str(self.default) + 'll'
+            elif self.pbtype in ['FLOAT']:
+                inner_init = str(self.default)
+                if 'e' not in inner_init and '.' not in inner_init:
+                    inner_init += '.'
+                inner_init += 'f'
             else:
                 inner_init = str(self.default)
 
@@ -416,9 +503,10 @@ class Field:
             return inner_init
 
         outer_init = None
-        if self.allocation == 'STATIC':
+        if self.is_static_allocation():
             if self.rules == 'REPEATED':
-                outer_init = '0, {'
+                outer_init = '0,' if not self.has_max_count else ''
+                outer_init += '{'
                 outer_init += ', '.join([inner_init] * self.max_count)
                 outer_init += '}'
             elif self.rules == 'OPTIONAL':
@@ -448,17 +536,21 @@ class Field:
         array_decl = ''
 
         if self.pbtype == 'STRING':
-            if self.allocation != 'STATIC':
+            if not self.is_static_allocation():
                 return None # Not implemented
             array_decl = '[%d]' % self.max_size
         elif self.pbtype == 'BYTES':
-            if self.allocation != 'STATIC':
+            if not self.is_static_allocation():
                 return None # Not implemented
 
         if declaration_only:
-            return 'extern const %s %s_default%s;' % (ctype, self.struct_name + self.name, array_decl)
+            return 'PB_DEFAULT_VALUE_QUALIFIER %s %s_default%s PB_DEFAULT_VALUE_SETTER(%s);' % (ctype, self.struct_name + self.name, array_decl, default)
         else:
             return 'const %s %s_default%s = %s;' % (ctype, self.struct_name + self.name, array_decl, default)
+
+    def is_static_allocation(self):
+        return self.allocation == 'STATIC' \
+            or self.allocation == 'STATIC_MAX' or self.allocation == 'STATIC_FIXED'
 
     def tags(self):
         '''Return the #define for the tag number of this field.'''
@@ -481,17 +573,17 @@ class Field:
         result += '%3d, ' % self.tag
         result += '%-8s, ' % self.pbtype
         result += '%s, ' % self.rules
-        result += '%-8s, ' % self.allocation
+        result += '%-12s, ' % self.allocation
         result += '%s, ' % ("FIRST" if not prev_field_name else "OTHER")
         result += '%s, ' % self.struct_name
         result += '%s, ' % self.name
         result += '%s, ' % (prev_field_name or self.name)
 
         if self.pbtype == 'MESSAGE':
-            result += '&%s_fields)' % self.submsgname
+            result += '&%s%s_fields)' % (ns_prefix(self.submsgname), self.submsgname)
         elif self.default is None:
             result += '0)'
-        elif self.pbtype in ['BYTES', 'STRING'] and self.allocation != 'STATIC':
+        elif self.pbtype in ['BYTES', 'STRING'] and not self.is_static_allocation():
             result += '0)' # Arbitrary size default values not implemented
         elif self.rules == 'OPTEXT':
             result += '0)' # Default value for extensions is not implemented
@@ -508,7 +600,7 @@ class Field:
         Returns numeric value or a C-expression for assert.'''
         check = []
         if self.pbtype == 'MESSAGE':
-            if self.rules == 'REPEATED' and self.allocation == 'STATIC':
+            if self.rules == 'REPEATED' and self.is_static_allocation():
                 check.append('pb_membersize(%s, %s[0])' % (self.struct_name, self.name))
             elif self.rules == 'ONEOF':
                 if self.anonymous:
@@ -527,7 +619,7 @@ class Field:
         including the field tag. If the size cannot be determined, returns
         None.'''
 
-        if self.allocation != 'STATIC':
+        if not self.is_static_allocation():
             return None
 
         if self.pbtype == 'MESSAGE':
@@ -594,6 +686,9 @@ class ExtensionRange(Field):
         self.default = None
         self.max_size = 0
         self.max_count = 0
+        self.has_max_count = False
+        self.decoder = None
+        self.has_max_size = False
 
     def __str__(self):
         return '    pb_extension_t *extensions;'
@@ -611,10 +706,10 @@ class ExtensionRange(Field):
         return EncodedSize(0)
 
 class ExtensionField(Field):
-    def __init__(self, struct_name, desc, field_options):
+    def __init__(self, local_namespaces, struct_name, desc, field_options, enums):
         self.fullname = struct_name + desc.name
         self.extendee_name = names_from_type_name(desc.extendee)
-        Field.__init__(self, self.fullname + 'struct', desc, field_options)
+        Field.__init__(self, local_namespaces, self.fullname + 'struct', desc, field_options, enums)
 
         if self.rules != 'OPTIONAL':
             self.skip = True
@@ -753,7 +848,7 @@ class OneOf(Field):
 
 
 class Message:
-    def __init__(self, names, desc, message_options):
+    def __init__(self, names, desc, message_options, enums):
         self.name = names
         self.fields = []
         self.oneofs = {}
@@ -776,12 +871,37 @@ class Message:
                     self.oneofs[i] = oneof
                     self.fields.append(oneof)
 
+        self.from_header = None
+        if message_options.HasField("from_header"):
+            self.from_header = message_options.from_header
+
+        self.is_gamecomponent = False
+        if message_options.HasField("is_gamecomponent"):
+            self.is_gamecomponent = message_options.is_gamecomponent
+
+        self.has_fastpool_chunksize = False
+        if message_options.HasField("fastpool_chunksize"):
+            self.fastpool_chunksize = message_options.fastpool_chunksize
+            self.has_fastpool_chunksize = True
+
+        self.has_onactivate = False
+        if message_options.HasField("has_onactivate"):
+            self.has_onactivate = message_options.has_onactivate
+
+        self.has_ondeactivate = False
+        if message_options.HasField("has_ondeactivate"):
+            self.has_ondeactivate = message_options.has_ondeactivate
+
+        self.has_onloaded = False
+        if message_options.HasField("has_onloaded"):
+            self.has_onloaded = message_options.has_onloaded
+
         for f in desc.field:
             field_options = get_nanopb_suboptions(f, message_options, self.name + f.name)
             if field_options.type == nanopb_pb2.FT_IGNORE:
                 continue
 
-            field = Field(self.name, f, field_options)
+            field = Field(names.namespaces, self.name, f, field_options, enums)
             if (hasattr(f, 'oneof_index') and
                 f.HasField('oneof_index') and
                 f.oneof_index not in no_unions):
@@ -808,27 +928,30 @@ class Message:
         return deps
 
     def __str__(self):
-        result = 'typedef struct _%s {\n' % self.name
+        if self.from_header != None:
+            return "#include \"" + self.from_header + "\""
+        else:
+            result = 'typedef struct _%s {\n' % self.name
 
-        if not self.ordered_fields:
-            # Empty structs are not allowed in C standard.
-            # Therefore add a dummy field if an empty message occurs.
-            result += '    char dummy_field;'
+            if not self.ordered_fields:
+                # Empty structs are not allowed in C standard.
+                # Therefore add a dummy field if an empty message occurs.
+                result += '    char dummy_field;'
 
-        result += '\n'.join([str(f) for f in self.ordered_fields])
-        result += '\n/* @@protoc_insertion_point(struct:%s) */' % self.name
-        result += '\n}'
+            result += '\n'.join([str(f) for f in self.ordered_fields])
+            result += '\n/* @@protoc_insertion_point(struct:%s) */' % self.name
+            result += '\n}'
 
-        if self.packed:
-            result += ' pb_packed'
+            if self.packed:
+                result += ' pb_packed'
 
-        result += ' %s;' % self.name
+            result += ' %s;' % self.name
 
-        if self.packed:
-            result = 'PB_PACKED_STRUCT_START\n' + result
-            result += '\nPB_PACKED_STRUCT_END'
+            if self.packed:
+                result = 'PB_PACKED_STRUCT_START\n' + result
+                result += '\nPB_PACKED_STRUCT_END'
 
-        return result
+            return result
 
     def types(self):
         return ''.join([f.types() for f in self.fields])
@@ -872,6 +995,71 @@ class Message:
         result = 'extern const pb_field_t %s_fields[%d];' % (self.name, self.count_all_fields() + 1)
         return result
 
+    def fields_template_specialization_propagate(self, func):
+        for field in self.fields:
+            if field.allocation == 'CALLBACK' and field.decoder != None:
+                yield '\t\tmsg->%s.%s();' % (field.name, func)
+            elif field.pbtype == 'MESSAGE':
+                if field.rules == 'REPEATED' and field.is_static_allocation():
+                    yield '\t\tfor(size_t i = 0; i < %d; i++)' % (field.max_count)
+                    yield '\t\t\t%sPB(&msg->%s[i]);' % (func, field.name)
+                else:
+                    yield '\t\t%sPB(&msg->%s);' % (func, field.name)
+
+    def fields_template_specialization(self, namespaces):
+        ns = '::'.join(namespaces) + ('::' if namespaces else '')
+        crc =  zlib.crc32(str(self.name))
+        crc += 2**32 if crc < 0 else 0
+
+        result = 'template <>\nstruct ProtocolBufferFields< ::%s%s > : public ProtocolBufferFieldsBase {\n' % (ns, self.name)
+        result += '\tenum { ID = 0x%08xU };\n' % (crc)
+        result += '\tstatic const pb_field_t * Spec() { return ::%s%s_fields; };\n' % (ns, self.name)
+        result += '\tstatic constexpr const char* Name = "%s%s";\n' % (ns, self.name)
+        result += '\tstatic void Init(::%s%s *msg) { ::%s%s_init(msg); };\n' % (ns, self.name, ns, self.name)
+        prop = '\n'.join(self.fields_template_specialization_propagate("PreLoad"))
+        if len(prop) > 0:
+            result += '\tstatic void PreLoad(void* pMsg) {\n' 
+            result += '\t\t::%s%s *msg = (::%s%s*)pMsg;\n' % (ns, self.name,ns, self.name)
+            result += prop
+            result += '\n\t}\n'
+        prop = '\n'.join(self.fields_template_specialization_propagate("PostLoad"))
+        if len(prop) > 0:
+            result += '\tstatic void PostLoad(void* pMsg) {\n'
+            result += '\t\t::%s%s *msg = (::%s%s*)pMsg;\n' % (ns, self.name,ns, self.name)
+            result += prop
+            result += '\n\t}\n'
+        prop = '\n'.join(self.fields_template_specialization_propagate("PreSave"))
+        if len(prop) > 0:
+            result += '\tstatic void PreSave(void* pMsg) {\n' 
+            result += '\t\t::%s%s *msg = (::%s%s*)pMsg;\n' % (ns, self.name,ns, self.name)
+            result += prop
+            result += '\n\t}\n'
+        prop = '\n'.join(self.fields_template_specialization_propagate("PostSave"))
+        if len(prop) > 0:
+            result += '\tstatic void PostSave(void* pMsg) {\n'
+            result += '\t\t::%s%s *msg = (::%s%s*)pMsg;\n' % (ns, self.name,ns, self.name)
+            result += prop
+            result += '\n\t}\n'
+        result += '};'
+
+        has_custom_component_properties = self.has_fastpool_chunksize or self.has_onloaded or self.has_ondeactivate or self.has_onactivate
+        if has_custom_component_properties:
+            result += '\ntemplate <>\nstruct ComponentProperties< ::%s%s > {\n' % (ns, self.name)
+            result += '\tstatic constexpr uint32 FastPoolChunkSize = %d;\n' % (self.fastpool_chunksize if self.has_fastpool_chunksize else 0)
+            result += '\tstatic constexpr bool HasOnLoaded = %s;\n' % ("true" if self.has_onloaded else "false")
+            result += '\tstatic constexpr bool HasOnActivate = %s;\n' % ("true" if self.has_onactivate else "false")
+            result += '\tstatic constexpr bool HasOnDeactivate = %s;\n' % ("true" if self.has_ondeactivate else "false")
+            result += '};'
+
+        if self.has_onactivate:
+            result += '\ntemplate<> void OnActivate< ::%s%s >(Component< ::%s%s >& component);' % (ns, self.name, ns, self.name)
+        if self.has_ondeactivate:
+            result += '\ntemplate<> void OnDeactivate< ::%s%s >(Component< ::%s%s >& component, ComponentLoadHandles& handles);' % (ns, self.name, ns, self.name)
+        if self.has_onloaded:
+            result += '\ntemplate<> void OnLoaded< ::%s%s >(Component< ::%s%s >& component, ComponentLoadHandles& handles, bool bWasLoadedPreviously);' % (ns, self.name, ns, self.name)
+
+        return result
+
     def fields_definition(self):
         result = 'const pb_field_t %s_fields[%d] = {\n' % (self.name, self.count_all_fields() + 1)
 
@@ -882,6 +1070,42 @@ class Message:
             prev = field.get_last_field_name()
 
         result += '    PB_LAST_FIELD\n};'
+        return result
+
+    def init_function_declaration(self):
+        result = 'void %s_init(%s*);' % (self.name, self.name)
+        return result
+
+    def init_function_definition(self):
+        result = 'void %s_init(%s *self)\n' % (self.name, self.name)
+        result += '{\n'
+        for field in self.ordered_fields:
+            array_suffix = ""
+            is_c_string = field.pbtype == 'STRING' and field.decoder == None
+            has_default = field.default != None or field.pbtype in ('ENUM', 'UENUM')
+            skip_init = field.pbtype != 'MESSAGE' and not is_c_string and not has_default
+            if field.rules == 'REPEATED':
+                if field.has_max_count:
+                    if not skip_init:
+                        result += '    for(int i = 0; i < %s::%s_max_count; ++i)\n    ' % (self.name, field.name)
+                        array_suffix = "[i]"
+                else:
+                    if field.allocation != 'CALLBACK':
+                        result += '    self->%s_count = 0;\n' % (field.name)
+                    skip_init = True
+            elif field.rules == 'OPTIONAL':
+                result += '    self->has_%s = false;\n' % ( field.name )
+
+            if not skip_init:
+                if field.pbtype == 'MESSAGE':
+                    result += '    %s_init(&self->%s%s);\n' % (field.submsgname, field.name, array_suffix)
+                elif is_c_string:
+                    result += '    self->%s%s[0] = \'\\0\';\n' % (field.name, array_suffix)
+                elif field.default == None and field.pbtype in ('ENUM', 'UENUM'):
+                    result += '    self->%s%s = %s%s_init_default;\n' % (field.name, array_suffix, ns_prefix(field.ctype, '_'), field.ctype)
+                else:
+                    result += '    self->%s%s = %s_default;\n' % (field.name, array_suffix, field.struct_name + field.name)
+        result += '}\n'
         return result
 
     def encoded_size(self, dependencies):
@@ -958,6 +1182,16 @@ def sort_dependencies(messages):
         if msgname in message_by_name:
             yield message_by_name[msgname]
 
+def make_prefixed_identifier(filename, headername):
+    '''Make #ifndef identifier with USAGI_ prefix if necessary'''
+    result = ""
+    foobar = [p.upper() for p in os.path.normpath(os.path.dirname(filename)).split(os.sep)]
+    isEngine = 'ENGINE' in [p.upper() for p in foobar]
+    if isEngine:
+        result += "USAGI_"
+    result += make_identifier(headername)
+    return result
+
 def make_identifier(headername):
     '''Make #ifndef identifier that contains uppercase A-Z and digits 0-9'''
     result = ""
@@ -985,10 +1219,7 @@ class ProtoFile:
         self.messages = []
         self.extensions = []
 
-        if self.fdesc.package:
-            base_name = Names(self.fdesc.package.split('.'))
-        else:
-            base_name = Names()
+        base_name = Names((), self.fdesc.package.split('.'))
 
         for enum in self.fdesc.enum_type:
             enum_options = get_nanopb_suboptions(enum, self.file_options, base_name + enum.name)
@@ -1000,15 +1231,16 @@ class ProtoFile:
             if message_options.skip_message:
                 continue
 
-            self.messages.append(Message(names, message, message_options))
             for enum in message.enum_type:
                 enum_options = get_nanopb_suboptions(enum, message_options, names + enum.name)
                 self.enums.append(Enum(names, enum, enum_options))
 
+            self.messages.append(Message(names, message, message_options, self.enums))
+
         for names, extension in iterate_extensions(self.fdesc, base_name):
             field_options = get_nanopb_suboptions(extension, self.file_options, names + extension.name)
             if field_options.type != nanopb_pb2.FT_IGNORE:
-                self.extensions.append(ExtensionField(names, extension, field_options))
+                self.extensions.append(ExtensionField(names.namespaces, names, extension, field_options, self.enums))
 
     def add_dependency(self, other):
         for enum in other.enums:
@@ -1034,7 +1266,17 @@ class ProtoFile:
                         if field.pbtype == 'ENUM' and field.ctype == enum.names:
                             field.pbtype = 'UENUM'
 
-    def generate_header(self, includes, headername, options):
+    def is_component_file(self, namespaces):
+        at_least_one_component_defined = False
+        if "Components" in namespaces:
+            at_least_one_component_defined = True
+        for msg in self.messages:
+            if msg.is_gamecomponent:
+                at_least_one_component_defined = True
+                break      
+        return at_least_one_component_defined
+
+    def generate_header(self, namespaces, includes, headername, ifndefsymbol, options):
         '''Generate content for a header file.
         Generates strings, which should be concatenated and stored to file.
         '''
@@ -1045,11 +1287,28 @@ class ProtoFile:
         else:
             yield '/* Generated by %s at %s. */\n\n' % (nanopb_version, time.asctime())
 
-        symbol = make_identifier(headername)
-        yield '#ifndef PB_%s_INCLUDED\n' % symbol
-        yield '#define PB_%s_INCLUDED\n' % symbol
+
+        # ifndefsymbol = make_identifier(headername)
+        yield '#ifndef PB_%s_INCLUDED\n' % ifndefsymbol
+        yield '#define PB_%s_INCLUDED\n' % ifndefsymbol
         try:
             yield options.libformat % ('pb.h')
+            yield options.libformat % ('Engine/Core/ProtocolBuffers.h')
+
+            if self.is_component_file(namespaces):
+                yield options.libformat % ('Engine/Framework/ComponentProperties.h')
+
+            requires_components_header = lambda msg: (msg.has_onactivate or
+                                                      msg.has_ondeactivate or
+                                                      msg.has_onloaded)            
+            if any(requires_components_header(msg) for msg in self.messages):
+                yield options.libformat % ('Engine/Framework/GameComponents.h')
+
+            requires_string_header = lambda msg: ( any(field.decoder == "PBU8String" for field in msg.fields)     )
+            if any(requires_string_header(msg) for msg in self.messages):
+                yield options.libformat % ('Engine/Core/ProtocolBuffers/PBU8String.h')
+
+
         except TypeError:
             # no %s specified - use whatever was passed in as options.libformat
             yield options.libformat
@@ -1067,9 +1326,12 @@ class ProtoFile:
         yield '#endif\n'
         yield '\n'
 
-        yield '#ifdef __cplusplus\n'
-        yield 'extern "C" {\n'
-        yield '#endif\n\n'
+        for msg in sort_dependencies(self.messages):
+            if msg.from_header != None:
+                yield str(msg) + '\n'
+
+        for namespace in namespaces:
+            yield 'namespace ' + namespace + '\n{\n\n'
 
         if self.enums:
             yield '/* Enum definitions */\n'
@@ -1080,7 +1342,8 @@ class ProtoFile:
             yield '/* Struct definitions */\n'
             for msg in sort_dependencies(self.messages):
                 yield msg.types()
-                yield str(msg) + '\n\n'
+                if msg.from_header == None:
+                    yield str(msg) + '\n\n'
 
         if self.extensions:
             yield '/* Extensions */\n'
@@ -1088,20 +1351,35 @@ class ProtoFile:
                 yield extension.extension_decl()
             yield '\n'
 
+        if self.enums:
+            yield '/* Initializer values for enums */\n'
+            for enum in self.enums:
+                identifier = '%s%s_init_default' % (ns_prefix(enum.names, '_'), enum.names)
+                yield '#define %-40s %s%s\n' % (identifier, ns_prefix(enum.names), enum.default)
+            yield '\n'
+
         if self.messages:
             yield '/* Default values for struct fields */\n'
+            yield '#ifdef DEBUG_BUILD\n'
+            yield '#define PB_DEFAULT_VALUE_QUALIFIER extern const\n'
+            yield '#define PB_DEFAULT_VALUE_SETTER(value)\n'
+            yield '#else\n'
+            yield '#define PB_DEFAULT_VALUE_QUALIFIER constexpr\n'
+            yield '#define PB_DEFAULT_VALUE_SETTER(value) =(value)\n'
+            yield '#endif\n'
             for msg in self.messages:
                 yield msg.default_decl(True)
             yield '\n'
 
-            yield '/* Initializer values for message structs */\n'
-            for msg in self.messages:
-                identifier = '%s_init_default' % msg.name
-                yield '#define %-40s %s\n' % (identifier, msg.get_initializer(False))
-            for msg in self.messages:
-                identifier = '%s_init_zero' % msg.name
-                yield '#define %-40s %s\n' % (identifier, msg.get_initializer(True))
-            yield '\n'
+            # These are currently unused
+            #yield '/* Initializer values for message structs */\n'
+            #for msg in self.messages:
+            #    identifier = '%s%s_init_default' % (ns_prefix(msg.name, '_'), msg.name)
+            #    yield '#define %-40s %s\n' % (identifier, msg.get_initializer(False))
+            #for msg in self.messages:
+            #    identifier = '%s%s_init_zero' % (ns_prefix(msg.name, '_'), msg.name)
+            #    yield '#define %-40s %s\n' % (identifier, msg.get_initializer(True))
+            #yield '\n'
 
             yield '/* Field tags (for use in manual encoding/decoding) */\n'
             for msg in sort_dependencies(self.messages):
@@ -1124,6 +1402,11 @@ class ProtoFile:
                     yield '#define %-40s %s\n' % (identifier, msize)
                 else:
                     yield '/* %s depends on runtime parameters */\n' % identifier
+            yield '\n'
+
+            yield '/* Initialiser functions (set default values) */\n'
+            for msg in self.messages:
+                yield msg.init_function_declaration() + '\n'
             yield '\n'
 
             yield '/* Message IDs (where set with "msgid" option) */\n'
@@ -1153,15 +1436,26 @@ class ProtoFile:
 
             yield '#endif\n\n'
 
-        yield '#ifdef __cplusplus\n'
-        yield '} /* extern "C" */\n'
-        yield '#endif\n'
+        for namespace in namespaces:
+            yield '}\n'
+
+        yield '/* Template specializations */\n'
+        yield 'namespace usg {\n'
+        for msg in self.messages:
+            yield msg.fields_template_specialization(namespaces) + '\n'
+        yield '\n'
+        yield '}\n'
+
+        yield '\n#include "%s"\n' % headername.replace(".pb.h", ".lua.h")
+
+        if self.file_options.include != None and self.file_options.include != "":
+            yield "#include \"%s\"\n" % self.file_options.include
 
         # End of header
         yield '/* @@protoc_insertion_point(eof) */\n'
         yield '\n#endif\n'
 
-    def generate_source(self, headername, options):
+    def generate_source(self, namespaces, headername, options):
         '''Generate content for a source file.'''
 
         yield '/* Automatically generated nanopb constant definitions */\n'
@@ -1169,6 +1463,7 @@ class ProtoFile:
             yield '/* Generated by %s */\n\n' % (nanopb_version)
         else:
             yield '/* Generated by %s at %s. */\n\n' % (nanopb_version, time.asctime())
+        yield '#include "Engine/Common/Common.h"\n'
         yield options.genformat % (headername)
         yield '\n'
         yield '/* @@protoc_insertion_point(includes) */\n'
@@ -1178,13 +1473,52 @@ class ProtoFile:
         yield '#endif\n'
         yield '\n'
 
+        at_least_one_component_defined = self.is_component_file(namespaces)
+
+        at_least_one_event_defined = False
+        if "Events" in namespaces:
+            at_least_one_event_defined = True
+
+        if at_least_one_event_defined:
+            ns = '::'.join(namespaces) + ('::' if namespaces else '')
+            yield '#include "Engine/Framework/SystemCoordinator.h"\n\n'
+            yield '#include "Engine/Framework/EventManager.h"\n\n'
+            yield 'namespace usg\n{\n'
+            for msg in self.messages:
+                yield '\ttemplate<>\n'
+                yield '\tvoid RegisterEvent<::%s%s>(SystemCoordinator& sc)\n' % (ns,msg.name)
+                yield '\t{\n'
+                yield '\t\tsc.RegisterProtocolBufferType<::%s%s>();\n' % (ns,msg.name)
+                yield '\t\tsc.RegisterSignal<OnEventSignal<::%s%s>>();\n' % (ns,msg.name)
+                yield '\t}\n\n'
+            yield '}\n\n'
+
+        if at_least_one_component_defined:
+            ns = '::'.join(namespaces) + ('::' if namespaces else '')
+            yield '#include "Engine/Framework/SystemCoordinator.h"\n\n'
+            yield 'namespace usg\n{\n\n'
+            for msg in self.messages:
+                if msg.is_gamecomponent or "Components" in namespaces:
+                    yield '\ttemplate<>\n'
+                    yield '\tvoid RegisterComponent<::%s%s>(SystemCoordinator& systemCoordinator)\n' % (ns,msg.name)
+                    yield '\t{\n'
+                    yield '\t\tsystemCoordinator.RegisterComponent<::%s%s>();\n' % (ns, msg.name)
+                    yield '\t}\n'
+                    yield '\n'
+            yield '}\n\n'
+
+        for namespace in namespaces:
+            yield 'namespace ' + namespace + '\n{\n\n'
+
+        yield '#ifdef DEBUG_BUILD\n'
         for msg in self.messages:
             yield msg.default_decl(False)
 
-        yield '\n\n'
+        yield '#endif\n\n\n'
 
         for msg in self.messages:
             yield msg.fields_definition() + '\n\n'
+            yield msg.init_function_definition() + '\n\n'
 
         for ext in self.extensions:
             yield ext.extension_def() + '\n'
@@ -1262,6 +1596,9 @@ class ProtoFile:
             yield ' * To get rid of this error, remove any double fields from your .proto.\n'
             yield ' */\n'
             yield 'PB_STATIC_ASSERT(sizeof(double) == 8, DOUBLE_MUST_BE_8_BYTES)\n'
+
+        for namespace in namespaces:
+            yield '}\n'
 
         yield '\n'
         yield '/* @@protoc_insertion_point(eof) */\n'
@@ -1425,7 +1762,7 @@ def parse_file(filename, fdesc, options):
     Globals.matched_namemasks = set()
 
     # Parse the file
-    file_options = get_nanopb_suboptions(fdesc, toplevel_options, Names([filename]))
+    file_options = get_nanopb_suboptions(fdesc, toplevel_options, Names([filename], fdesc.package.split('.')))
     f = ProtoFile(fdesc, file_options)
     f.optfilename = optfilename
 
@@ -1454,16 +1791,21 @@ def process_file(filename, fdesc, options, other_files = {}):
     # Decide the file names
     noext = os.path.splitext(filename)[0]
     headername = noext + options.extension + '.h'
-    sourcename = noext + options.extension + '.c'
+    sourcename = noext + options.extension + '.cpp'
     headerbasename = os.path.basename(headername)
+    ifndefsymbol = make_prefixed_identifier(filename, headername)
 
     # List of .proto files that should not be included in the C header file
     # even if they are mentioned in the source .proto.
-    excludes = ['nanopb.proto', 'google/protobuf/descriptor.proto'] + options.exclude
+    excludes = ['nanopb.proto', 'google/protobuf/descriptor.proto', 'Engine/Core/usagipb.proto'] + options.exclude
     includes = [d for d in f.fdesc.dependency if d not in excludes]
 
-    headerdata = ''.join(f.generate_header(includes, headerbasename, options))
-    sourcedata = ''.join(f.generate_source(headerbasename, options))
+    namespaces = []
+    if fdesc.package:
+        namespaces = fdesc.package.split('.')
+
+    headerdata = ''.join(f.generate_header(namespaces, includes, headername, ifndefsymbol, options))
+    sourcedata = ''.join(f.generate_source(namespaces, headerbasename, options))
 
     # Check if there were any lines in .options that did not match a member
     unmatched = [n for n,o in Globals.separate_options if n not in Globals.matched_namemasks]

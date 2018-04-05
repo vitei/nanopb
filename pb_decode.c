@@ -657,6 +657,7 @@ static bool checkreturn decode_field(pb_istream_t *stream, pb_wire_type_t wire_t
     switch (PB_ATYPE(iter->pos->type))
     {
         case PB_ATYPE_STATIC:
+        case PB_ATYPE_STATIC_FIXED:
             return decode_static_field(stream, wire_type, iter);
         
         case PB_ATYPE_POINTER:
@@ -764,7 +765,7 @@ static void pb_field_set_to_default(pb_field_iter_t *iter)
             ext = ext->next;
         }
     }
-    else if (PB_ATYPE(type) == PB_ATYPE_STATIC)
+    else if (PB_ATYPE_IS_STATIC(type))
     {
         bool init_data = true;
         if (PB_HTYPE(type) == PB_HTYPE_OPTIONAL)
@@ -1243,7 +1244,7 @@ static bool checkreturn pb_dec_bytes(pb_istream_t *stream, const pb_field_t *fie
     uint32_t size;
     size_t alloc_size;
     pb_bytes_array_t *bdest;
-    
+
     if (!pb_decode_varint32(stream, &size))
         return false;
     
@@ -1254,6 +1255,31 @@ static bool checkreturn pb_dec_bytes(pb_istream_t *stream, const pb_field_t *fie
     if (size > alloc_size)
         PB_RETURN_ERROR(stream, "size too large");
     
+	/* Handle the case where the 'has_max_size' option was used. */
+	if (PB_ATYPE(field->type) == PB_ATYPE_STATIC_FIXED) {
+		uint8_t *bdest_f;
+
+		if (PB_ATYPE(field->type) == PB_ATYPE_POINTER)
+		{
+#ifndef PB_ENABLE_MALLOC
+			PB_RETURN_ERROR(stream, "no malloc support");
+#else
+			if (!allocate_field(stream, dest, PB_BYTES_ARRAY_FIXED_T_ALLOCSIZE(size), 1))
+				return false;
+			bdest_f = *(uint8_t**)dest;
+#endif
+		}
+		else
+		{
+			if (PB_BYTES_ARRAY_FIXED_T_ALLOCSIZE(size) > field->data_size)
+				PB_RETURN_ERROR(stream, "bytes overflow");
+			bdest_f = (uint8_t*)dest;
+		}
+
+		return pb_read(stream, bdest_f, size);
+	}
+
+	/* Handle byte fields that don't use the 'has_max_size' option. */
     if (PB_ATYPE(field->type) == PB_ATYPE_POINTER)
     {
 #ifndef PB_ENABLE_MALLOC

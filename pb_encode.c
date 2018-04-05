@@ -209,8 +209,10 @@ static bool checkreturn encode_basic_field(pb_ostream_t *stream,
     
     if (field->size_offset)
         pSize = (const char*)pData + field->size_offset;
-    else
+    else if (field->type == PB_HTYPE_OPTIONAL)
         pSize = &implicit_has;
+    else
+        pSize = &field->array_size;
 
     if (PB_ATYPE(field->type) == PB_ATYPE_POINTER)
     {
@@ -296,6 +298,7 @@ static bool checkreturn encode_field(pb_ostream_t *stream,
     switch (PB_ATYPE(field->type))
     {
         case PB_ATYPE_STATIC:
+        case PB_ATYPE_STATIC_FIXED:
         case PB_ATYPE_POINTER:
             return encode_basic_field(stream, field, pData);
         
@@ -637,13 +640,20 @@ static bool checkreturn pb_enc_fixed32(pb_ostream_t *stream, const pb_field_t *f
 static bool checkreturn pb_enc_bytes(pb_ostream_t *stream, const pb_field_t *field, const void *src)
 {
     const pb_bytes_array_t *bytes = (const pb_bytes_array_t*)src;
-    
+
     if (src == NULL)
     {
         /* Threat null pointer as an empty bytes field */
         return pb_encode_string(stream, NULL, 0);
     }
-    
+
+    if (PB_ATYPE(field->type) == PB_ATYPE_STATIC_FIXED)
+    {
+	    const uint8_t *bytes_f = (const uint8_t*)src;
+
+	    return pb_encode_string(stream, bytes_f, field->data_size);
+    }
+
     if (PB_ATYPE(field->type) == PB_ATYPE_STATIC &&
         PB_BYTES_ARRAY_T_ALLOCSIZE(bytes->size) > field->data_size)
     {

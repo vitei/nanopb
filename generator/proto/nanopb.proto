@@ -65,6 +65,47 @@ message NanoPBOptions {
 
   // decode oneof as anonymous union
   optional bool anonymous_oneof = 11 [default = false];
+
+  // Assume we have max_count entries in the array, so we don't need the
+  // "fieldname_count" field.  Only makes sense when max_count is set.
+  optional bool has_max_count = 12 [default = false];
+
+  // Replace struct definition with a header include, allowing us to define it
+  // ourselves.
+  optional string from_header = 13;
+
+  // Makes repeated fields use our C++ ProtocolBufferVarLength type instead of
+  // nanopb's native pb_callback_t type.  The string value represents the delegate
+  // we should use for decoding.
+  optional string decoder = 14;
+
+  // Assume we have max_count entries in an array of bytes, so we don't need the
+  // "size" field in the struct.  Only makes sense when max_size is set.
+  optional bool has_max_size = 15;
+
+  // Like max_count, but allows us to use an enum as the value.
+  // You pass the enum as a string, and the number of entries in that enum
+  // will be used as the max_count.
+  optional string max_count_enum = 16;
+
+  // These settings output declarations for the OnActivate/OnDeactivate/OnLoaded
+  // specialisations, to force us to provide an implementation. Very Usagi specific!
+  optional bool has_onactivate = 17 [default = false];
+  optional bool has_ondeactivate = 18 [default = false];
+  optional bool has_onloaded = 19 [default = false];
+
+  // This allows us to include some headers at the bottom of the file, after all
+  // the message types (useful for template specialisations)
+  optional string include = 20;
+
+  // The following two lua-related events should really be in usagipb.proto...
+  optional bool lua_receive = 21 [default = true]; // OnEvent callbacks will be fired
+  optional bool lua_send    = 22 [default = true]; // Lua scripts can call Send() on this type
+  optional bool lua_generate = 23 [default = false]; // Lua scripts can call Send() on this type
+
+  // Default pool size for components
+  optional uint32 fastpool_chunksize = 30 [default = 20];
+  optional bool is_gamecomponent = 31 [default = false];
 }
 
 // Extensions to protoc 'Descriptor' type in order to define options
